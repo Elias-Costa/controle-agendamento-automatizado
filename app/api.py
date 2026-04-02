@@ -1,105 +1,99 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, BackgroundTasks
-from sqlalchemy.orm import Session
-from app.database import get_db
-from app import services, schemas, ai_agent, whatsapp_client
-import json
+import os
+from datetime import datetime
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+
+from app import ai_agent, schemas, services, whatsapp_client
+from app.database import SessionLocal
 
 router = APIRouter()
 
-# --- AUXILIAR: PROCESSAMENTO ASSÍNCRONO ---
-# Usamos BackgroundTasks para responder "200 OK" rápido pro WhatsApp (evita timeout)
-# e processar a inteligência depois.
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "testetoken123")
+DEFAULT_BARBEARIA_ID = int(os.getenv("DEFAULT_BARBEARIA_ID", "1"))
+DEFAULT_SERVICO_ID = int(os.getenv("DEFAULT_SERVICO_ID", "1"))
 
-def processar_mensagem_whatsapp(payload: dict, db: Session):
-    """
-    Função principal que orquestra: Receber -> Pensar -> Agir -> Responder
-    """
+
+def _extrair_mensagem_texto(payload: dict) -> tuple[str, str] | tuple[None, None]:
+    entry = payload.get("entry", [{}])[0]
+    changes = entry.get("changes", [{}])[0]
+    value = changes.get("value", {})
+
+    if "messages" not in value:
+        status = value.get("statuses", [{}])[0]
+        status_type = status.get("status")
+        if status_type:
+            print(f"Atualizacao de status: {status_type.upper()}")
+            if status_type == "failed":
+                print(f"Motivo da falha: {status.get('errors', [])}")
+        return None, None
+
+    message = value["messages"][0]
+    if message.get("type") != "text":
+        return None, None
+
+    telefone_cliente = message.get("from")
+    texto_usuario = message.get("text", {}).get("body")
+    if not telefone_cliente or not texto_usuario:
+        return None, None
+
+    return telefone_cliente, texto_usuario
+
+
+def processar_mensagem_whatsapp(payload: dict) -> None:
+    db = SessionLocal()
     try:
-        # 1. Extrair dados básicos da mensagem (Lógica de Parse do JSON da Meta)
-        entry = payload['entry'][0]
-        changes = entry['changes'][0]
-        value = changes['value']
-        
-        if 'messages' not in value:
-            if 'statuses' in value:
-                status = value['statuses'][0]
-                status_type = status['status']
-                print(f"Atualização de Status: {status_type.upper()}")
-                
-                # Se falhou, mostra o motivo
-                if status_type == 'failed':
-                    errors = status.get('errors', [])
-                    print(f"Motivo da falha: {errors}")
+        telefone_cliente, texto_usuario = _extrair_mensagem_texto(payload)
+        if not telefone_cliente or not texto_usuario:
             return
 
-        message = value['messages'][0]
-        telefone_cliente = message['from'] # Ex: 551199999999
-        texto_usuario = message['text']['body']
-        
         print(f"Mensagem de {telefone_cliente}: {texto_usuario}")
 
-        # 2. Inteligência Artificial (AI Agent)
         analise_ia = ai_agent.analisar_mensagem(texto_usuario)
         intencao = analise_ia.get("intencao")
         dados = analise_ia.get("dados", {})
-        resposta_final = analise_ia.get("resposta_texto")
+        resposta_final = analise_ia.get("resposta_texto") or "Entendi. Pode me passar mais detalhes?"
 
-        # 3. Lógica de Negócio (Services)
-        # Se a IA detectou intenção de AGENDAR e temos data/hora, tentamos efetivar.
         if intencao == "AGENDAR" and dados.get("data") and dados.get("hora"):
             try:
-                # Busca IDs (Hardcoded para 1 no MVP, mas viria do contexto em produção)
-                barbearia_id = 1 
-                # Tenta achar o serviço pelo nome que a IA extraiu (ex: "Corte")
-                # Aqui simplificamos usando ID 1 se não achar, para o teste funcionar
-                servico_id = 1 
-                
-                # Monta objeto para criar
+                inicio = datetime.fromisoformat(f"{dados['data']}T{dados['hora']}:00")
                 novo_agendamento = schemas.AgendamentoCreate(
-                    barbearia_id=barbearia_id,
-                    servico_id=servico_id,
+                    barbearia_id=DEFAULT_BARBEARIA_ID,
+                    servico_id=DEFAULT_SERVICO_ID,
                     cliente_telefone=telefone_cliente,
-                    data_hora_inicio=f"{dados['data']}T{dados['hora']}:00",
-                    data_hora_fim=f"{dados['data']}T{dados['hora']}:00" # O service corrige isso
+                    data_hora_inicio=inicio,
+                    data_hora_fim=inicio,
                 )
-                
-                agendamento = services.criar_agendamento(db, novo_agendamento)
-                
-                # Se deu certo, sobrescreve a resposta da IA com a confirmação oficial
-                resposta_final = f"Agendado com sucesso! Te espero dia {dados['data']} às {dados['hora']}."
-            
-            except HTTPException as e:
-                # Se o horário estiver ocupado (Erro 409), avisa o usuário
-                resposta_final = f"Ops! {e.detail}. Tente outro horário."
-            except Exception as e:
-                print(f"Erro genérico ao agendar: {e}")
-                resposta_final = "Tive um erro interno ao tentar salvar seu horário."
+                services.criar_agendamento(db, novo_agendamento)
+                resposta_final = f"Agendado com sucesso! Te espero dia {dados['data']} as {dados['hora']}."
+            except HTTPException as exc:
+                resposta_final = f"Ops! {exc.detail}. Tente outro horario."
+            except ValueError:
+                resposta_final = "Nao consegui entender data/hora. Pode enviar no formato DD/MM as HH:MM?"
+            except Exception as exc:
+                print(f"Erro generico ao agendar: {exc}")
+                resposta_final = "Tive um erro interno ao tentar salvar seu horario."
 
-        # 4. Enviar Resposta no WhatsApp
         whatsapp_client.enviar_mensagem(telefone_cliente, resposta_final)
 
-    except Exception as e:
-        print(f"Erro fatal no processamento: {e}")
+    except Exception as exc:
+        print(f"Erro fatal no processamento: {exc}")
+    finally:
+        db.close()
 
-# --- ROTAS ---
 
 @router.get("/webhook")
-async def verify_webhook(hub_mode: str = Query(alias="hub.mode"), 
-                         hub_challenge: str = Query(alias="hub.challenge"), 
-                         hub_verify_token: str = Query(alias="hub.verify_token")):
-    VERIFY_TOKEN = "testetoken123" 
-    if hub_verify_token == VERIFY_TOKEN:
+async def verify_webhook(
+    hub_mode: str = Query(alias="hub.mode"),
+    hub_challenge: str = Query(alias="hub.challenge"),
+    hub_verify_token: str = Query(alias="hub.verify_token"),
+):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return int(hub_challenge)
-    raise HTTPException(status_code=403, detail="Token inválido")
+    raise HTTPException(status_code=403, detail="Token invalido")
+
 
 @router.post("/webhook")
-async def webhook_whatsapp(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """
-    Recebe o JSON, responde 200 OK imediatamente e manda processar em segundo plano.
-    """
+async def webhook_whatsapp(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
-    
-    # Joga o processamento pesado para background para não travar o WhatsApp
-    background_tasks.add_task(processar_mensagem_whatsapp, payload, db)
-    
+    background_tasks.add_task(processar_mensagem_whatsapp, payload)
     return {"status": "recebido"}

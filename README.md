@@ -66,11 +66,12 @@ O sistema opera em um fluxo de 4 etapas:
     GEMINI_API_KEY="SuaChaveAqui"
     WHATSAPP_TOKEN="SeuTokenMeta"
     WHATSAPP_PHONE_ID="SeuPhoneID"
+    WHATSAPP_VERIFY_TOKEN="SeuTokenDeVerificacao"
 
 5. **Inicialize o Banco de Dados: Execute o script para criar as tabelas e popular com dados de teste:**
     ```
     python create_db.py
-    python seed.py
+    python seed_data.py
 
 6. **Execute o servidor:**
    ```
